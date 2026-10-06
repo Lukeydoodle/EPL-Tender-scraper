@@ -7,6 +7,8 @@ from the two official government sources (no API key needed):
 
   * Find a Tender Service (FTS)  - above-threshold contracts
   * Contracts Finder (CF)        - below-threshold contracts (England)
+  * Public Contracts Scotland    - Scottish public sector
+  * Sell2Wales                   - Welsh public sector
 
 It scores each notice for relevance (CPV codes + keywords), extracts buyer
 contact details, deadlines, values, award/selection criteria, documents and
@@ -54,6 +56,9 @@ KEYWORD_GROUPS = {
         "energy and utilities", "energy services", "utilities management", "utility management",
         "energy contract management", "risk management energy", "electricity and gas",
         "gas and electricity", "energy supply contracts", "tariff review",
+        "energy contract", "energy contracts", "energy contract procurement",
+        "procurement of electricity", "procurement of gas", "utility contracts",
+        "utilities contracts", "energy renewal", "contract renewal energy",
     ],
     "Bill Validation / Bureau": [
         "bill validation", "invoice validation", "utility bill", "utility bills",
@@ -86,6 +91,25 @@ KEYWORD_GROUPS = {
         "power purchase agreement", "power purchase agreements", "ppa", "cppa",
         "corporate ppa", "sleeved ppa", "virtual ppa", "offsite ppa",
     ],
+    "Waste Management": [
+        "waste management", "waste collection", "waste collections", "commercial waste",
+        "trade waste", "general waste", "food waste", "dry mixed recycling", "recycling services",
+        "recycling collection", "waste disposal", "waste services", "confidential waste",
+        "clinical waste", "hazardous waste", "skip hire", "waste and recycling",
+        "waste brokerage", "waste broker", "waste reduction", "zero to landfill",
+    ],
+    "Card Payments / Merchant Services": [
+        "card payment", "card payments", "card payment services", "card processing",
+        "payment card processing", "merchant services", "merchant acquiring", "card acquiring",
+        "acquiring services", "payment processing", "payment processing services",
+        "chip and pin", "pdq", "card terminals", "card machines", "contactless payment",
+        "payment gateway", "online payments", "income management",
+    ],
+    "Water": [
+        "water supply", "water retail", "water retailer", "water services", "water and wastewater",
+        "water and sewerage", "wastewater services", "water procurement", "water bill",
+        "water bills", "water audit", "water management", "water leak detection", "trade effluent",
+    ],
     "Carbon / Compliance": [
         "esos", "energy savings opportunity scheme", "secr",
         "streamlined energy and carbon reporting", "carbon reporting", "carbon accounting",
@@ -109,7 +133,8 @@ EXCLUDE_KEYWORDS = [
     "insulation", "cavity wall", "external wall insulation", "window replacement",
     "boiler replacement", "boiler servicing", "roofing", "kitchen replacement",
     "bathroom replacement", "gas servicing", "gas safety", "street lighting maintenance",
-    "solar eclipse",
+    "solar eclipse", "radioactive waste", "nuclear decommissioning", "water main",
+    "water mains", "water hygiene", "legionella", "drinking water fountains",
 ]
 
 # CPV code prefixes and how much a match adds to the score.
@@ -125,6 +150,10 @@ CPV_WEIGHTS = {
     "31440": 2,     # Batteries (storage)
     "38550": 2,     # Meters
     "79418": 2,     # Procurement consultancy
+    "905": 3,       # Refuse and waste related services
+    "66172": 3,     # Financial transaction processing (card payments)
+    "66110": 2,     # Banking services
+    "651": 2,       # Water distribution
     "093": 1,       # Electricity, heating, solar and nuclear energy (broad)
     "65": 1,        # Public utilities (broad)
     "79411": 1,     # General management consultancy (broad)
@@ -140,6 +169,14 @@ DEFAULT_MIN_SCORE = 4
 
 FTS_URL = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
 CF_URL = "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search"
+PCS_URL = "https://api.publiccontractsscotland.gov.uk/v1/Notices"
+S2W_URL = "https://api.sell2wales.gov.wales/v1/Notices"
+PCS_SEARCH = "https://www.publiccontractsscotland.gov.uk/search/search_mainpage.aspx"
+S2W_SEARCH = "https://www.sell2wales.gov.wales/search/search_mainpage.aspx"
+# Scotland/Wales notice types per stage: 1 = prior information, 2 = contract notice, 3 = award
+MONTHLY_TYPES = {"planning": [1], "tender": [2], "award": [3]}
+SOURCE_NAMES = {"fts": "Find a Tender", "cf": "Contracts Finder",
+                "pcs": "Public Contracts Scotland", "s2w": "Sell2Wales"}
 FTS_NOTICE = "https://www.find-tender.service.gov.uk/Notice/{}"
 CF_NOTICE = "https://www.contractsfinder.service.gov.uk/Notice/{}"
 
@@ -173,14 +210,85 @@ def _get(session, url, params=None):
     raise RuntimeError(f"Gave up on {url}")
 
 
+def _months(date_from, date_to):
+    y, m = date_from.year, date_from.month
+    while (y, m) <= (date_to.year, date_to.month):
+        yield f"{m:02d}-{y}"
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+
+
+def _releases_from(data):
+    """The Scotland/Wales feeds return a release package or a list of them."""
+    if isinstance(data, dict):
+        if "releases" in data:
+            return data["releases"] or []
+        for k in ("results", "notices", "packages"):
+            if isinstance(data.get(k), list):
+                return [r for p in data[k] for r in _releases_from(p)]
+        return [data] if data.get("ocid") else []
+    if isinstance(data, list):
+        return [r for p in data for r in _releases_from(p)]
+    return []
+
+
+def fetch_monthly(source, date_from, date_to, stage):
+    """Public Contracts Scotland / Sell2Wales: monthly OCDS feeds."""
+    session = requests.Session()
+    url = PCS_URL if source == "pcs" else S2W_URL
+    for month in _months(date_from, date_to):
+        for nt in MONTHLY_TYPES.get(stage, []):
+            params = {"dateFrom": month, "noticeType": nt, "outputType": 0}
+            if source == "s2w":
+                params["locale"] = 2057
+            try:
+                data = _get(session, url, params)
+            except Exception as e:  # a regional feed being down must not stop the run
+                print(f"  {source.upper()} unavailable for {month} ({e})", file=sys.stderr)
+                continue
+            rels = _releases_from(data)
+            kept = 0
+            for rel in rels:
+                d = parse_dt(rel.get("date"))
+                if d and not (date_from <= d <= date_to + timedelta(days=1)):
+                    continue
+                kept += 1
+                yield source, rel
+            print(f"  {source.upper()} [{stage}] {month}: {kept} notices")
+            time.sleep(SLEEP_BETWEEN)
+
+
 def fetch_releases(source, date_from, date_to, stages):
     """Yield (source, release) for every release in the window, following pagination."""
+    if source in ("pcs", "s2w"):
+        yield from fetch_monthly(source, date_from, date_to, stages)
+        return
+    if source == "fts" and stages in ("tender", "planning"):
+        # Fetch every FTS notice in the window once (no stage filter on the API side,
+        # so new Procurement Act notice types aren't missed), then split by stage here.
+        key = (date_from, date_to)
+        if key not in _FTS_CACHE:
+            _FTS_CACHE[key] = list(_fetch_paged("fts", date_from, date_to, None))
+        for src, rel in _FTS_CACHE[key]:
+            if stage_of(rel) == stages:
+                yield src, rel
+        return
+    yield from _fetch_paged(source, date_from, date_to, stages)
+
+
+_FTS_CACHE = {}
+
+
+def _fetch_paged(source, date_from, date_to, stages):
     session = requests.Session()
     fmt = "%Y-%m-%dT%H:%M:%S"
     if source == "fts":
         url = FTS_URL
         params = {"updatedFrom": date_from.strftime(fmt), "updatedTo": date_to.strftime(fmt),
-                  "stages": stages, "limit": 100}
+                  "limit": 100}
+        if stages:
+            params["stages"] = stages
     else:
         url = CF_URL
         params = {"publishedFrom": date_from.strftime(fmt), "publishedTo": date_to.strftime(fmt),
@@ -195,7 +303,7 @@ def fetch_releases(source, date_from, date_to, stages):
         releases = data.get("releases", [])
         for rel in releases:
             yield source, rel
-        print(f"  {source.upper()} [{stages}] page {pages}: {len(releases)} notices")
+        print(f"  {source.upper()} [{stages or 'all'}] page {pages}: {len(releases)} notices")
 
         nxt = (data.get("links") or {}).get("next")
         if nxt and releases:
@@ -317,6 +425,13 @@ def criteria_text(block):
 
 
 def notice_url(source, rel):
+    if source in ("pcs", "s2w"):
+        tender = rel.get("tender") or {}
+        for d in tender.get("documents") or []:
+            u = d.get("url") or ""
+            if "search_view" in u or "notice" in u.lower():
+                return u
+        return PCS_SEARCH if source == "pcs" else S2W_SEARCH
     if source == "fts":
         return FTS_NOTICE.format(rel.get("id", ""))
     ocid = rel.get("ocid", "")
@@ -442,7 +557,7 @@ def to_record(source, rel):
     contract_end = max(end_dates) if end_dates else None
 
     return {
-        "source": "Find a Tender" if source == "fts" else "Contracts Finder",
+        "source": SOURCE_NAMES.get(source, source),
         "ocid": rel.get("ocid"),
         "stage": stage_of(rel),
         "score": score,
@@ -506,7 +621,10 @@ def collect(sources, stages, date_from, date_to, min_score, region=None):
 
     # Cross-source de-dup: same buyer + title published on both portals
     seen, out = set(), []
-    for rec in sorted(latest.values(), key=lambda r: r["source"] != "Find a Tender"):
+    for rec in sorted(latest.values(), key=lambda r: ["Find a Tender", "Public Contracts Scotland",
+                                             "Sell2Wales", "Contracts Finder"].index(r["source"])
+                     if r["source"] in ("Find a Tender", "Public Contracts Scotland", "Sell2Wales",
+                                        "Contracts Finder") else 9):
         k = (rec["buyer"].lower(), re.sub(r"\W+", "", rec["title"].lower())[:80])
         if k in seen:
             continue
@@ -657,7 +775,7 @@ def build_workbook(opps, awards, args, path):
         ("Generated", now.strftime("%d %b %Y %H:%M")),
         ("Window", f"Last {args.days} days (tenders/pipeline)" +
                    (f", last {args.award_days} days (awards)" if args.awards else "")),
-        ("Sources", "Find a Tender Service + Contracts Finder (official OCDS APIs)"),
+        ("Sources", "Find a Tender, Contracts Finder, Public Contracts Scotland, Sell2Wales (official OCDS feeds)"),
         ("Minimum score", args.min_score),
         ("Region filter", args.region or "None"),
         ("Opportunities", len(opps)),
@@ -687,7 +805,8 @@ def main():
     ap.add_argument("--open-only", action="store_true", help="drop tenders whose deadline has passed")
     ap.add_argument("--no-planning", action="store_true", help="skip pipeline/early engagement notices")
     ap.add_argument("--region", help='filter on region text or NUTS code, e.g. "North East" or UKC')
-    ap.add_argument("--sources", default="fts,cf", help="fts, cf or fts,cf (default both)")
+    ap.add_argument("--sources", default="fts,cf,pcs,s2w",
+                    help="any of fts,cf,pcs,s2w (default all: England, Scotland, Wales, UK-wide)")
     ap.add_argument("--awards", action="store_true", help="also pull award notices for incumbent intel")
     ap.add_argument("--award-days", type=int, default=730, help="look-back for awards (default 730)")
     ap.add_argument("--out", default=None, help="output .xlsx path")
@@ -695,7 +814,7 @@ def main():
     ap.add_argument("--email", action="store_true", help="email new matches (needs SMTP_* environment variables)")
     args = ap.parse_args()
 
-    sources = [s.strip() for s in args.sources.split(",") if s.strip() in ("fts", "cf")]
+    sources = [s.strip() for s in args.sources.split(",") if s.strip() in ("fts", "cf", "pcs", "s2w")]
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     stages = ["tender"] + ([] if args.no_planning else ["planning"])
 

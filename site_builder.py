@@ -251,7 +251,7 @@ th{font-size:13px;color:var(--muted);font-weight:600;border-bottom:1.5px solid v
     <select id="months"><option value="6">6 months</option><option value="12">12 months</option><option value="18" selected>18 months</option><option value="36">3 years</option><option value="9999">Any time</option></select></label>
 </div>
 <div id="out"></div>
-<p class="note" style="margin-top:24px">Sources: Find a Tender and Contracts Finder. While a tender is live, contact the buyer only through the portal's clarification route.</p>
+<p class="note" style="margin-top:24px">Sources: Find a Tender, Contracts Finder, Public Contracts Scotland and Sell2Wales. While a tender is live, contact the buyer only through the portal's clarification route.</p>
 </div>
 <script>
 const DATA = __DATA__;
