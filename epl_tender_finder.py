@@ -321,3 +321,5 @@ def notice_url(source, rel):
         return FTS_NOTICE.format(rel.get("id", ""))
     ocid = rel.get("ocid", "")
     guid = ocid.split("ocds-b5fd17-")[-1] if "ocds-b5fd17-" in ocid else
+ if __name__ == "__main__":
+    main()
