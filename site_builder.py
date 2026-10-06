@@ -16,6 +16,49 @@ from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
+PBKDF2_ITERATIONS = 250_000
+
+
+def _password():
+    return os.environ.get("SITE_PASSWORD") or None
+
+
+def _encrypt(data: bytes, password: str) -> bytes:
+    """salt(16) | iv(12) | AES-256-GCM ciphertext+tag. Matches the WebCrypto code in the page."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    salt, iv = os.urandom(16), os.urandom(12)
+    key = PBKDF2HMAC(hashes.SHA256(), 32, salt, PBKDF2_ITERATIONS).derive(password.encode())
+    return salt + iv + AESGCM(key).encrypt(iv, data, None)
+
+
+def _decrypt(blob: bytes, password: str) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    salt, iv, ct = blob[:16], blob[16:28], blob[28:]
+    key = PBKDF2HMAC(hashes.SHA256(), 32, salt, PBKDF2_ITERATIONS).derive(password.encode())
+    return AESGCM(key).decrypt(iv, ct, None)
+
+
+def _load_payload(site_dir):
+    """Previous run's data: encrypted file if a password is set, else plain JSON."""
+    d = Path(site_dir)
+    pw = _password()
+    if pw and (d / "data.enc").exists():
+        try:
+            return json.loads(_decrypt((d / "data.enc").read_bytes(), pw))
+        except Exception as e:
+            print(f"Could not decrypt previous data ({e.__class__.__name__}); starting fresh")
+            return {}
+    if (d / "data.json").exists():
+        try:
+            return json.loads((d / "data.json").read_text())
+        except ValueError:
+            return {}
+    return {}
+
 
 def _key(r):
     return r.get("ocid") or r.get("url") or (r.get("buyer", "") + r.get("title", ""))
@@ -62,20 +105,42 @@ def mark_new(site_dir, opps):
     return new
 
 
+def load_previous_opps(site_dir):
+    data = _load_payload(site_dir)
+    return [{k: _parse(v) for k, v in o.items()} for o in data.get("opps", [])]
+
+
+def merge_opps(previous, fresh, keep_days=45):
+    """Fresh notices replace older copies; earlier finds stay while still relevant."""
+    now = datetime.now()
+    merged = {}
+    for r in previous:
+        dl = r.get("deadline")
+        seen = r.get("first_seen")
+        try:
+            seen_dt = datetime.fromisoformat(seen) if isinstance(seen, str) else None
+        except ValueError:
+            seen_dt = None
+        if isinstance(dl, datetime):
+            if dl < now - timedelta(days=1):
+                continue          # closed: drop it
+        elif seen_dt and seen_dt < now - timedelta(days=max(keep_days, 90)):
+            continue              # no deadline and old: drop it
+        r.pop("is_new", None)
+        merged[_key(r)] = r
+    for r in fresh:
+        merged[_key(r)] = r
+    return list(merged.values())
+
+
 def load_previous_awards(site_dir):
-    path = Path(site_dir) / "data.json"
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text())
-        return [{k: _parse(v) for k, v in a.items()} for a in data.get("awards", [])]
-    except (ValueError, KeyError):
-        return []
+    data = _load_payload(site_dir)
+    return [{k: _parse(v) for k, v in a.items()} for a in data.get("awards", [])]
 
 
 # ---------------------------------------------------------------- site
 
-def write_site(site_dir, opps, awards, new_items):
+def write_site(site_dir, opps, awards, new_items, xlsx_path=None):
     d = Path(site_dir)
     d.mkdir(parents=True, exist_ok=True)
     seen, uniq = set(), []
@@ -91,9 +156,23 @@ def write_site(site_dir, opps, awards, new_items):
         "awards": [_jsonable(r) for r in awards],
         "new_count": len([r for r in opps if r.get("is_new")]),
     }
-    (d / "data.json").write_text(json.dumps(payload, default=str))
-    embedded = json.dumps(payload, default=str).replace("</", "<\\/")
-    (d / "index.html").write_text(PAGE.replace("__DATA__", embedded), encoding="utf-8")
+    raw = json.dumps(payload, default=str)
+    pw = _password()
+    if pw:
+        # Everything published is encrypted; remove any plain copies from earlier runs.
+        (d / "data.enc").write_bytes(_encrypt(raw.encode(), pw))
+        xlsx = Path(xlsx_path) if xlsx_path else d / "EPL_Tenders_latest.xlsx"
+        if xlsx.exists():
+            (d / "tenders.xlsx.enc").write_bytes(_encrypt(xlsx.read_bytes(), pw))
+            xlsx.unlink()
+        for old in ("data.json", "EPL_Tenders_latest.xlsx"):
+            if (d / old).exists():
+                (d / old).unlink()
+        html_page = PAGE.replace("__DATA__", "null").replace("__ITER__", str(PBKDF2_ITERATIONS))
+    else:
+        (d / "data.json").write_text(raw)
+        html_page = PAGE.replace("__DATA__", raw.replace("</", "<\\/")).replace("__ITER__", "0")
+    (d / "index.html").write_text(html_page, encoding="utf-8")
     (d / ".nojekyll").write_text("")
     print(f"Site written to {d}/index.html")
 
@@ -229,14 +308,35 @@ table{border-collapse:collapse;width:100%;min-width:820px;font-size:14px}
 th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}
 th{font-size:13px;color:var(--muted);font-weight:600;border-bottom:1.5px solid var(--ink)}
 .note{font-size:13px;color:var(--muted)}
+.gate{max-width:360px;margin:12vh auto 0;padding:28px 24px;background:var(--panel);border:1.5px solid var(--ink);border-radius:4px;display:flex;flex-direction:column;gap:10px}
+.gate h1{font-size:36px}
+.gate input[type=password]{font:inherit;padding:10px;border:1.5px solid var(--line);border-radius:3px;background:var(--paper);color:inherit}
+.gate .btn{cursor:pointer;font:inherit;font-weight:600}
+.remember{display:flex;gap:6px;align-items:center}
+.err{color:var(--hot);margin:0;min-height:1.2em;font-size:14px}
+.btn.ghost{background:transparent;color:var(--ink);cursor:pointer;font:inherit;font-weight:600}
 @media (max-width:700px){summary{grid-template-columns:56px minmax(0,1fr)}.val{grid-column:2;text-align:left}.body{padding-left:6px}}
 </style>
 </head>
 <body>
-<div class="wrap">
+<div id="gate" hidden>
+  <form id="gateForm" class="gate" autocomplete="on">
+    <h1>Tender finder</h1>
+    <p class="note">Ecologic Partners. Enter the team password to continue.</p>
+    <label for="pw" class="note">Password</label>
+    <input id="pw" type="password" autocomplete="current-password" required autofocus>
+    <label class="note remember"><input type="checkbox" id="remember"> Stay signed in on this device</label>
+    <button class="btn" type="submit" id="unlock">Unlock</button>
+    <p class="err" id="gateErr" role="alert"></p>
+  </form>
+</div>
+<div class="wrap" id="site" hidden>
 <header>
   <div><h1>Tender finder</h1><p class="updated" id="updated"></p></div>
-  <a class="btn" href="EPL_Tenders_latest.xlsx" download>Download Excel</a>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <a class="btn" id="dl" href="EPL_Tenders_latest.xlsx" download>Download Excel</a>
+    <button class="btn ghost" type="button" id="signout" hidden>Sign out</button>
+  </div>
 </header>
 <div class="tabs" role="tablist">
   <button role="tab" data-v="live" aria-selected="true" type="button">Live tenders <span class="n" id="nLive"></span></button>
@@ -254,8 +354,67 @@ th{font-size:13px;color:var(--muted);font-weight:600;border-bottom:1.5px solid v
 <p class="note" style="margin-top:24px">Sources: Find a Tender, Contracts Finder, Public Contracts Scotland and Sell2Wales. While a tender is live, contact the buyer only through the portal's clarification route.</p>
 </div>
 <script>
-const DATA = __DATA__;
+const EMBEDDED = __DATA__;
+const ITER = __ITER__;
 const $ = id => document.getElementById(id);
+let KEY = null;
+
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+async function keyFor(pw, salt){
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+  return crypto.subtle.deriveBits({name:"PBKDF2", hash:"SHA-256", salt, iterations: ITER}, base, 256);
+}
+async function decryptBlob(buf, rawKeyOrPw){
+  const bytes = new Uint8Array(buf), salt = bytes.slice(0,16), iv = bytes.slice(16,28), ct = bytes.slice(28);
+  const bits = typeof rawKeyOrPw === "string" ? await keyFor(rawKeyOrPw, salt) : null;
+  const key = await crypto.subtle.importKey("raw", bits, "AES-GCM", false, ["decrypt"]);
+  return { plain: await crypto.subtle.decrypt({name:"AES-GCM", iv}, key, ct), bits };
+}
+async function fetchBuf(name){
+  const r = await fetch(name + "?v=" + Date.now(), {cache: "no-store"});
+  if (!r.ok) throw new Error("missing " + name);
+  return r.arrayBuffer();
+}
+const store = {
+  get(){ try { return sessionStorage.getItem("epl_pw") || localStorage.getItem("epl_pw"); } catch { return null; } },
+  set(pw, keep){ try { (keep ? localStorage : sessionStorage).setItem("epl_pw", pw); } catch {} },
+  clear(){ try { sessionStorage.removeItem("epl_pw"); localStorage.removeItem("epl_pw"); } catch {} }
+};
+async function unlock(pw, keep){
+  const { plain } = await decryptBlob(await fetchBuf("data.enc"), pw);
+  KEY = pw;
+  store.set(pw, keep);
+  $("gate").hidden = true; $("site").hidden = false; $("signout").hidden = false;
+  start(JSON.parse(new TextDecoder().decode(plain)));
+}
+function boot(){
+  if (EMBEDDED) { $("site").hidden = false; start(EMBEDDED); return; }
+  $("dl").removeAttribute("href");
+  $("dl").addEventListener("click", async e => {
+    e.preventDefault();
+    try {
+      const { plain } = await decryptBlob(await fetchBuf("tenders.xlsx.enc"), KEY);
+      const url = URL.createObjectURL(new Blob([plain], {type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}));
+      const a = document.createElement("a"); a.href = url; a.download = "EPL_Tenders_latest.xlsx"; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch { alert("The Excel file couldn't be opened. Try again after the next scan."); }
+  });
+  $("signout").onclick = () => { store.clear(); location.reload(); };
+  const saved = store.get();
+  const showGate = msg => { $("gate").hidden = false; $("gateErr").textContent = msg || ""; $("pw").focus(); };
+  $("gateForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    $("unlock").disabled = true; $("gateErr").textContent = "";
+    try { await unlock($("pw").value, $("remember").checked); }
+    catch (err) { showGate(String(err.message).startsWith("missing") ? "The site is still being built. Try again in a few minutes." : "That password isn't right."); }
+    finally { $("unlock").disabled = false; }
+  });
+  if (saved) unlock(saved, false).catch(() => { store.clear(); showGate(); });
+  else showGate();
+}
+
+function start(DATA){
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const safe = u => /^https?:\/\//i.test(String(u||"").trim()) ? String(u).trim() : "";
 const link = (u, label) => safe(u) ? `<a href="${esc(safe(u))}" target="_blank" rel="noopener">${esc(label || u)}</a>` : esc(u);
@@ -328,6 +487,8 @@ document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
   view = b.dataset.v; document.querySelectorAll(".tabs button").forEach(x => x.setAttribute("aria-selected", x === b)); render(); });
 ["q","cat","newOnly","months"].forEach(id => $(id).addEventListener("input", render));
 render();
+}
+boot();
 </script>
 </body>
 </html>

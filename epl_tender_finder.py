@@ -199,6 +199,8 @@ SSL_RELAXED_HOSTS = ("api.publiccontractsscotland.gov.uk", "api.sell2wales.gov.w
 
 def _get(session, url, params=None):
     """GET with retry/backoff on rate limits and transient errors."""
+    regional = any(h in url for h in SSL_RELAXED_HOSTS)
+    server_errors = 0
     verify = True
     network_failures = 0
     for attempt in range(10):
@@ -216,6 +218,12 @@ def _get(session, url, params=None):
             wait = 5 * network_failures
             print(f"  network error ({e.__class__.__name__}); retrying in {wait}s", file=sys.stderr)
             time.sleep(wait)
+            continue
+        if r.status_code >= 500 and regional:
+            server_errors += 1
+            if server_errors >= 2:  # regional feeds: don't burn minutes on a broken server
+                raise RuntimeError(f"HTTP {r.status_code} from {url}")
+            time.sleep(3)
             continue
         if r.status_code == 429 or r.status_code >= 500:
             try:
@@ -256,8 +264,13 @@ def _releases_from(data):
     return []
 
 
+_DEAD_SOURCES = set()
+
+
 def fetch_monthly(source, date_from, date_to, stage):
     """Public Contracts Scotland / Sell2Wales: monthly OCDS feeds."""
+    if source in _DEAD_SOURCES:
+        return
     session = requests.Session()
     url = PCS_URL if source == "pcs" else S2W_URL
     for month in _months(date_from, date_to):
@@ -268,8 +281,9 @@ def fetch_monthly(source, date_from, date_to, stage):
             try:
                 data = _get(session, url, params)
             except Exception as e:  # a regional feed being down must not stop the run
-                print(f"  {source.upper()} unavailable for {month} ({e})", file=sys.stderr)
-                continue
+                print(f"  {source.upper()} unavailable, skipping it this run ({e})", file=sys.stderr)
+                _DEAD_SOURCES.add(source)
+                return
             rels = _releases_from(data)
             kept = 0
             for rel in rels:
@@ -826,6 +840,10 @@ def build_workbook(opps, awards, args, path):
 # --------------------------------------------------------------------------
 
 def main():
+    try:  # show progress lines live in the GitHub log
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
     ap = argparse.ArgumentParser(description="Find UK public energy tenders for EPL")
     ap.add_argument("--days", type=int, default=30, help="look-back window for tenders (default 30)")
     ap.add_argument("--min-score", type=int, default=DEFAULT_MIN_SCORE)
@@ -839,13 +857,26 @@ def main():
     ap.add_argument("--out", default=None, help="output .xlsx path")
     ap.add_argument("--site-dir", default=None, help="also publish a web page + data into this folder (e.g. docs)")
     ap.add_argument("--email", action="store_true", help="email new matches (needs SMTP_* environment variables)")
+    ap.add_argument("--update-days", type=int, default=4,
+                    help="with --site-dir, after the first run only fetch this many days and merge (default 4)")
     args = ap.parse_args()
 
     sources = [s.strip() for s in args.sources.split(",") if s.strip() in ("fts", "cf", "pcs", "s2w")]
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     stages = ["tender"] + ([] if args.no_planning else ["planning"])
 
-    opps = collect(sources, stages, now - timedelta(days=args.days), now, args.min_score, args.region)
+    lookback = args.days
+    previous = []
+    if args.site_dir:
+        import site_builder
+        previous = site_builder.load_previous_opps(args.site_dir)
+        if previous:  # first full sweep already done: just fetch recent notices and merge
+            lookback = min(args.days, args.update_days)
+            print(f"Incremental run: fetching the last {lookback} days, keeping {len(previous)} earlier finds")
+
+    opps = collect(sources, stages, now - timedelta(days=lookback), now, args.min_score, args.region)
+    if previous:
+        opps = site_builder.merge_opps(previous, opps, keep_days=args.days)
     if args.open_only:
         opps = [r for r in opps if r["deadline"] is None or r["deadline"] >= datetime.now()]
 
@@ -872,7 +903,7 @@ def main():
         new_items = site_builder.mark_new(args.site_dir, opps)
         out = args.out or f"{args.site_dir}/EPL_Tenders_latest.xlsx"
         build_workbook(opps, awards, args, out)
-        site_builder.write_site(args.site_dir, opps, awards, new_items)
+        site_builder.write_site(args.site_dir, opps, awards, new_items, xlsx_path=out)
         if args.email:
             site_builder.send_alert(new_items)
     else:
