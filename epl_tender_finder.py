@@ -34,6 +34,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -182,24 +185,44 @@ CF_NOTICE = "https://www.contractsfinder.service.gov.uk/Notice/{}"
 
 HEADERS = {"Accept": "application/json", "User-Agent": "EPL-TenderFinder/1.0"}
 MAX_PAGES = 600
-SLEEP_BETWEEN = 0.4  # be polite to the APIs
+SLEEP_BETWEEN = 1.0  # be polite to the APIs (Find a Tender rate-limits fast callers)
 
 # --------------------------------------------------------------------------
 # Fetching
 # --------------------------------------------------------------------------
 
+# These two regional feeds don't send their full SSL certificate chain, so a normal
+# certificate check fails. They are read-only public data, so for these hosts only
+# we retry without the certificate check rather than lose Scotland and Wales.
+SSL_RELAXED_HOSTS = ("api.publiccontractsscotland.gov.uk", "api.sell2wales.gov.wales")
+
+
 def _get(session, url, params=None):
     """GET with retry/backoff on rate limits and transient errors."""
-    for attempt in range(6):
+    verify = True
+    network_failures = 0
+    for attempt in range(10):
         try:
-            r = session.get(url, params=params, headers=HEADERS, timeout=60)
+            r = session.get(url, params=params, headers=HEADERS, timeout=60, verify=verify)
+        except requests.exceptions.SSLError as e:
+            if verify and any(h in url for h in SSL_RELAXED_HOSTS):
+                verify = False
+                continue
+            raise RuntimeError(f"SSL error on {url}: {e}")
         except requests.RequestException as e:
-            wait = 2 ** attempt
-            print(f"  network error ({e}); retrying in {wait}s", file=sys.stderr)
+            network_failures += 1
+            if network_failures >= 4:
+                raise RuntimeError(f"no response from {url}")
+            wait = 5 * network_failures
+            print(f"  network error ({e.__class__.__name__}); retrying in {wait}s", file=sys.stderr)
             time.sleep(wait)
             continue
         if r.status_code == 429 or r.status_code >= 500:
-            wait = int(r.headers.get("Retry-After", 2 ** attempt))
+            try:
+                wait = int(r.headers.get("Retry-After", 0)) or min(2 ** attempt, 60)
+            except ValueError:
+                wait = min(2 ** attempt, 60)
+            wait += 1
             print(f"  HTTP {r.status_code}; retrying in {wait}s", file=sys.stderr)
             time.sleep(wait)
             continue
@@ -296,7 +319,11 @@ def _fetch_paged(source, date_from, date_to, stages):
 
     pages = 0
     while url and pages < MAX_PAGES:
-        data = _get(session, url, params)
+        try:
+            data = _get(session, url, params)
+        except Exception as e:  # keep what we have rather than lose the whole run
+            print(f"  {source.upper()} stopped early after {pages} pages ({e})", file=sys.stderr)
+            break
         pages += 1
         if not data:
             break
